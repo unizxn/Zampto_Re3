@@ -479,35 +479,43 @@ def start_server(page) -> bool:
             continue
 
         # ── 轮询等待服务器真正变为 Running ──────────────────────────────
-        log.info("⏳ 等待服务器变为 Running（最多 3 分钟）...")
-        wait_total = 180   # 每次尝试最多等 3 分钟（比原来的 5 分钟短，失败后快速重试）
+        log.info("⏳ 等待服务器变为 Running（最多 5 分钟）...")
+        wait_total = 300
         poll_interval = 10
         elapsed = 0
         final_status = "Unknown"
+        offline_streak = 0  # 连续读到 Offline 的次数，避免瞬间误判
 
         while elapsed < wait_total:
             time.sleep(poll_interval)
             elapsed += poll_interval
             try:
                 page.reload(timeout=20000, wait_until="domcontentloaded")
-                time.sleep(3)
-                dismiss_all_popups(page)  # 每次刷新后清弹窗
+                time.sleep(4)  # 多等 1 秒让状态渲染完
+                dismiss_all_popups(page)
                 time.sleep(1)
                 body = get_text(page)
                 if "Running" in body:
                     final_status = "Running"
+                    offline_streak = 0
                     log.info(f"✅ 服务器已变为 Running（第 {attempt} 次尝试，等待了 {elapsed}s）")
                     take_screenshot(page, f"05_running_confirmed_attempt{attempt}")
                     break
                 elif "Starting" in body:
                     final_status = "Starting"
+                    offline_streak = 0
                     log.info(f"  [{elapsed}s] 还在 Starting，继续等待...")
                 elif "Offline" in body or "Stopped" in body:
-                    final_status = "Offline"
-                    log.warning(f"  [{elapsed}s] 服务器回到 Offline，本次启动失败")
-                    take_screenshot(page, f"05_start_failed_attempt{attempt}_{elapsed}s")
-                    break
+                    offline_streak += 1
+                    log.info(f"  [{elapsed}s] 读到 Offline（连续第 {offline_streak} 次），{'继续等待...' if offline_streak < 3 else '确认失败'}")
+                    if offline_streak >= 3:
+                        # 连续 3 次（30s）都是 Offline，才真正确认失败
+                        final_status = "Offline"
+                        take_screenshot(page, f"05_start_failed_attempt{attempt}_{elapsed}s")
+                        break
+                    # 否则继续等，可能只是页面还没渲染完
                 else:
+                    offline_streak = 0
                     log.info(f"  [{elapsed}s] 状态未知，继续等待...")
             except Exception as e:
                 log.warning(f"  [{elapsed}s] 刷新页面异常: {e}")
@@ -640,20 +648,42 @@ def renew_server(page, server_id: str, expiry_before: str) -> bool:
     dismiss_all_popups(page)
     time.sleep(1)
 
-    # 点击 Renew Server（<a> 标签，onclick，不是 <button>）
+    # 点击 Renew Server（<a> 标签带 onclick，需滚动到底部才可见）
     try:
-        renew_btn = page.locator(
-            'a:has-text("Renew Server"), button:has-text("Renew Server")'
-        ).first
-        if not renew_btn.is_visible(timeout=8000):
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            time.sleep(1)
-            renew_btn = page.locator(
-                'a:has-text("Renew Server"), button:has-text("Renew Server")'
-            ).first
+        # 先滚动到底部确保按钮进入视口
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        time.sleep(1)
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        time.sleep(1)
 
-        renew_btn.click()
-        log.info("已点击 Renew Server 按钮")
+        # 用 JS 直接触发按钮的 onclick（绕过遮挡问题）
+        clicked = page.evaluate("""() => {
+            // 优先找 action-button 类的 Renew Server 链接
+            var els = Array.from(document.querySelectorAll('a, button'));
+            for (var el of els) {
+                var txt = (el.innerText || el.textContent || '').trim();
+                if (txt === 'Renew Server' || txt.includes('Renew Server')) {
+                    // 滚动到元素位置
+                    el.scrollIntoView({block: 'center'});
+                    // 优先用 onclick 属性触发
+                    if (el.onclick) { el.onclick(new MouseEvent('click')); return 'onclick'; }
+                    el.click();
+                    return 'click';
+                }
+            }
+            return null;
+        }""")
+
+        if not clicked:
+            log.warning("JS 未找到 Renew Server 按钮，尝试 Playwright locator...")
+            renew_btn = page.locator('a:has-text("Renew Server"), button:has-text("Renew Server")').first
+            renew_btn.scroll_into_view_if_needed()
+            time.sleep(0.5)
+            renew_btn.click(force=True)
+            log.info("已点击 Renew Server 按钮（locator force click）")
+        else:
+            log.info(f"已点击 Renew Server 按钮（JS {clicked}）")
+
         take_screenshot(page, "05_renew_clicked")
     except Exception as e:
         log.warning(f"点击 Renew Server 失败: {e}")
@@ -673,9 +703,18 @@ def renew_server(page, server_id: str, expiry_before: str) -> bool:
         take_screenshot(page, "06_cf_timeout")
         return False
 
-    # 等待页面刷新 / 弹窗消失
-    time.sleep(5)
+    # 等待续期弹窗处理完成（CF 通过后弹窗会消失，页面可能刷新）
+    time.sleep(8)
     take_screenshot(page, "07_after_renew")
+
+    # 刷新页面重新读取最新 expiry（续期后页面不一定自动刷新）
+    try:
+        page.reload(timeout=20000, wait_until="domcontentloaded")
+        time.sleep(3)
+        dismiss_all_popups(page)
+        time.sleep(1)
+    except Exception as e:
+        log.warning(f"续期后刷新页面失败: {e}")
 
     # ✅ 用 expiry 是否增加来判断是否真正续期成功，不依赖弹窗状态
     info_after = page.evaluate("""() => {
